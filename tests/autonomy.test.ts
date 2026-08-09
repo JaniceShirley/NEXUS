@@ -110,7 +110,8 @@ describe('Production Autonomy & Resilience', () => {
     const mockLlm = new MockLlmProvider();
     const app = createApp(agentService, schedulerService, store, memory, mockLlm);
 
-    const res = await request(app).get('/api/agent/feed?agentId=abc-123');
+    const initRes = await request(app).post('/api/agent/init').send();
+    const res = await request(app).get(`/api/agent/feed?agentId=${initRes.body.agentId}`);
 
     expect(res.status).toBe(200);
     expect(res.body.posts).toEqual([]);

@@ -36,6 +36,21 @@ export function createRouter(
   // GET /api/agent/feed?agentId=abc-123
   router.get('/agent/feed', async (req: Request, res: Response) => {
     try {
+      const state = await store.getAgentState();
+
+      if (!state.initialized) {
+        return res.status(400).json({ error: 'Agent is not initialized yet. Call /api/agent/init first.' });
+      }
+
+      const requestedAgentId = req.query.agentId;
+      if (!requestedAgentId) {
+        return res.status(400).json({ error: 'Missing agentId query parameter.' });
+      }
+
+      if (requestedAgentId !== state.agentId) {
+        return res.status(403).json({ error: 'Invalid agentId.' });
+      }
+
       // Pure read from persistence store. Does NOT trigger ticks or generation!
       const feed = await agentService.getFeed();
       res.status(200).json({ posts: feed.posts });

@@ -24,7 +24,7 @@ describe('API Contract Endpoints & Hardening', () => {
     memory = new MemoryService('local');
     agentService = new NexusAgentService({ store, memory });
     schedulerService = new SchedulerService(agentService, 60);
-    app = createApp(agentService, schedulerService);
+    app = createApp(agentService, schedulerService, store, memory, { name: 'mock' } as any);
   });
 
   afterEach(() => {
@@ -67,7 +67,10 @@ describe('API Contract Endpoints & Hardening', () => {
   });
 
   it('GET /api/agent/feed should return empty posts array when no posts exist', async () => {
-    const res = await request(app).get('/api/agent/feed?agentId=abc-123');
+    const initRes = await request(app).post('/api/agent/init').send();
+    const agentId = initRes.body.agentId;
+
+    const res = await request(app).get(`/api/agent/feed?agentId=${agentId}`);
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ posts: [] });
@@ -92,7 +95,10 @@ describe('API Contract Endpoints & Hardening', () => {
     await store.addPost(post1);
     await store.addPost(post2);
 
-    const res = await request(app).get('/api/agent/feed?agentId=abc-123');
+    const initRes = await request(app).post('/api/agent/init').send();
+    const agentId = initRes.body.agentId;
+
+    const res = await request(app).get(`/api/agent/feed?agentId=${agentId}`);
 
     expect(res.status).toBe(200);
     expect(res.body.posts.length).toBe(2);
@@ -106,5 +112,25 @@ describe('API Contract Endpoints & Hardening', () => {
 
     expect(res.body.posts[0].sources[0]).toMatch(/^https?:\/\//);
     expect(res.body.posts[1].sources[0]).toMatch(/^https?:\/\//);
+  });
+
+  it('GET /api/agent/feed should return 400 if agentId query parameter is missing', async () => {
+    await request(app).post('/api/agent/init').send();
+    const res = await request(app).get('/api/agent/feed');
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('Missing agentId query parameter.');
+  });
+
+  it('GET /api/agent/feed should return 403 if agentId is invalid', async () => {
+    await request(app).post('/api/agent/init').send();
+    const res = await request(app).get('/api/agent/feed?agentId=wrong-id');
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe('Invalid agentId.');
+  });
+
+  it('GET /api/agent/feed should return 400 if agent is not initialized', async () => {
+    const res = await request(app).get('/api/agent/feed?agentId=abc-123');
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('Agent is not initialized yet. Call /api/agent/init first.');
   });
 });
