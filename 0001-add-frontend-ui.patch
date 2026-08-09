@@ -1,0 +1,748 @@
+From efce6e5223b3797c84e2922342c14df2be9adeef Mon Sep 17 00:00:00 2001
+From: NEXUS Frontend <nexus-frontend@local>
+Date: Sun, 9 Aug 2026 12:20:29 +0000
+Subject: [PATCH] Add read-only frontend UI for NEXUS feed
+
+- New public/index.html, styles.css, app.js: static dashboard that
+  polls GET /api/health and GET /api/agent/feed to render the live
+  autonomous feed, scheduler status, and cycle telemetry.
+- Frontend never calls POST /api/agent/init or /api/agent/tick -- it
+  only reads existing state, it does not mutate agent behavior.
+- src/api/app.ts: mount express.static(public) + SPA fallback AFTER
+  the existing /api router, so it can never shadow an API route.
+  No changes to agent, scheduler, discovery, editorial, generation,
+  memory, or persistence logic. Full existing test suite (42/42)
+  and tsc build verified green with this change applied.
+---
+ public/app.js     | 236 ++++++++++++++++++++++++++++++++
+ public/index.html |  87 ++++++++++++
+ public/styles.css | 342 ++++++++++++++++++++++++++++++++++++++++++++++
+ src/api/app.ts    |  14 ++
+ 4 files changed, 679 insertions(+)
+ create mode 100644 public/app.js
+ create mode 100644 public/index.html
+ create mode 100644 public/styles.css
+
+diff --git a/public/app.js b/public/app.js
+new file mode 100644
+index 0000000..74e9f06
+--- /dev/null
++++ b/public/app.js
+@@ -0,0 +1,236 @@
++// NEXUS read-only frontend.
++// Talks only to existing GET endpoints: /api/health and /api/agent/feed.
++// Never calls /api/agent/init or /api/agent/tick — this UI must not mutate agent state.
++
++const POLL_INTERVAL_MS = 30000;
++
++const el = {
++  statusPill: document.getElementById('status-pill'),
++  statusPillLabel: document.getElementById('status-pill-label'),
++  pulseDot: document.getElementById('pulse-dot'),
++  telScheduler: document.getElementById('tel-scheduler'),
++  telLlm: document.getElementById('tel-llm'),
++  telMemory: document.getElementById('tel-memory'),
++  telLastRun: document.getElementById('tel-lastrun'),
++  telAgentId: document.getElementById('tel-agentid'),
++  traceLine: document.getElementById('trace-line'),
++  feedState: document.getElementById('feed-state'),
++  feedList: document.getElementById('feed-list'),
++  refreshBtn: document.getElementById('refresh-btn'),
++};
++
++let cachedAgentId = null;
++
++function setStatusPill(mode, label) {
++  el.statusPill.classList.remove('live', 'down');
++  if (mode) el.statusPill.classList.add(mode);
++  el.statusPillLabel.textContent = label;
++}
++
++function formatRelativeTime(isoString) {
++  if (!isoString) return '—';
++  const then = new Date(isoString).getTime();
++  if (Number.isNaN(then)) return '—';
++  const diffMs = Date.now() - then;
++  const diffSec = Math.floor(diffMs / 1000);
++  if (diffSec < 5) return 'just now';
++  if (diffSec < 60) return `${diffSec}s ago`;
++  const diffMin = Math.floor(diffSec / 60);
++  if (diffMin < 60) return `${diffMin}m ago`;
++  const diffHr = Math.floor(diffMin / 60);
++  if (diffHr < 24) return `${diffHr}h ago`;
++  const diffDay = Math.floor(diffHr / 24);
++  return `${diffDay}d ago`;
++}
++
++function formatAbsoluteTime(isoString) {
++  if (!isoString) return '';
++  const d = new Date(isoString);
++  if (Number.isNaN(d.getTime())) return '';
++  return d.toLocaleString(undefined, {
++    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
++  });
++}
++
++// Draws a deterministic "signal trace" polyline seeded from tick metrics.
++// This is a genuine (if simplified) visualization: it maps discovered / accepted / rejected
++// counts from the most recent cycle into waveform amplitude — not decoration.
++function drawTrace(metrics) {
++  const width = 1000;
++  const height = 120;
++  const mid = 60;
++  const points = [];
++  const segments = 60;
++
++  const discovered = metrics?.discoveredCount ?? 0;
++  const accepted = metrics?.acceptedCount ?? 0;
++  const rejected = metrics?.rejectedCount ?? 0;
++  const total = Math.max(discovered, 1);
++
++  for (let i = 0; i <= segments; i++) {
++    const x = (i / segments) * width;
++    const t = i / segments;
++    let amplitude = 6 * Math.sin(t * Math.PI * 2 * 3);
++
++    // Spike proportional to accepted signal roughly a third of the way through,
++    // dip proportional to rejected hype two-thirds through.
++    const acceptPos = 0.32;
++    const rejectPos = 0.68;
++    const acceptSpike = (accepted / total) * 42 * Math.exp(-Math.pow((t - acceptPos) * 10, 2));
++    const rejectDip = (rejected / total) * 28 * Math.exp(-Math.pow((t - rejectPos) * 10, 2));
++
++    const y = mid - amplitude - acceptSpike + rejectDip;
++    points.push(`${x.toFixed(1)},${y.toFixed(1)}`);
++  }
++
++  el.traceLine.setAttribute('points', points.join(' '));
++}
++
++function renderTelemetry(health) {
++  const schedulerOn = !!health.schedulerActive;
++  el.telScheduler.textContent = schedulerOn ? 'Active' : 'Idle';
++  el.telLlm.textContent = health.llmProvider || '—';
++  el.telMemory.textContent = health.memoryProvider || '—';
++  el.telLastRun.textContent = health.lastRunAt
++    ? `${formatRelativeTime(health.lastRunAt)}`
++    : 'No cycles yet';
++  el.telAgentId.textContent = health.agentId || 'Not initialized';
++
++  if (health.initialized && schedulerOn) {
++    setStatusPill('live', 'Autonomous · Live');
++    el.pulseDot.style.background = '';
++  } else if (health.initialized) {
++    setStatusPill(null, 'Initialized · Idle');
++  } else {
++    setStatusPill('down', 'Not initialized');
++  }
++
++  drawTrace(health.lastTickMetrics);
++}
++
++function sourceHost(url) {
++  try {
++    return new URL(url).hostname.replace(/^www\./, '');
++  } catch {
++    return url;
++  }
++}
++
++function renderPost(post) {
++  const li = document.createElement('li');
++  li.className = 'post-card';
++
++  const meta = document.createElement('div');
++  meta.className = 'post-meta';
++  const idSpan = document.createElement('span');
++  idSpan.className = 'post-id';
++  idSpan.textContent = post.id;
++  const timeSpan = document.createElement('span');
++  timeSpan.title = post.createdAt || '';
++  timeSpan.textContent = post.createdAt
++    ? `${formatAbsoluteTime(post.createdAt)} · ${formatRelativeTime(post.createdAt)}`
++    : '';
++  meta.append(idSpan, timeSpan);
++
++  const text = document.createElement('p');
++  text.className = 'post-text';
++  text.textContent = post.text || '';
++
++  li.append(meta, text);
++
++  if (post.rationale) {
++    const rationale = document.createElement('div');
++    rationale.className = 'rationale';
++    const label = document.createElement('div');
++    label.className = 'rationale-label';
++    label.textContent = 'Editorial rationale';
++    const body = document.createElement('div');
++    body.className = 'rationale-body';
++    body.textContent = post.rationale;
++    rationale.append(label, body);
++    li.appendChild(rationale);
++  }
++
++  if (Array.isArray(post.sources) && post.sources.length) {
++    const sources = document.createElement('div');
++    sources.className = 'sources';
++    post.sources.forEach((url) => {
++      const a = document.createElement('a');
++      a.className = 'source-chip';
++      a.href = url;
++      a.target = '_blank';
++      a.rel = 'noopener noreferrer';
++      a.textContent = sourceHost(url);
++      sources.appendChild(a);
++    });
++    li.appendChild(sources);
++  }
++
++  return li;
++}
++
++function renderFeed(posts) {
++  el.feedList.innerHTML = '';
++
++  if (!posts || posts.length === 0) {
++    el.feedState.hidden = false;
++    el.feedList.hidden = true;
++    el.feedState.innerHTML = '<div class="empty-state">No posts published yet. NEXUS publishes autonomously once its editorial judge accepts a topic — check back after the next cycle.</div>';
++    return;
++  }
++
++  el.feedState.hidden = true;
++  el.feedList.hidden = false;
++  posts.forEach((post) => el.feedList.appendChild(renderPost(post)));
++}
++
++function showFeedError(message) {
++  el.feedState.hidden = false;
++  el.feedList.hidden = true;
++  el.feedState.innerHTML = `<div class="empty-state error">${message}</div>`;
++}
++
++async function fetchHealth() {
++  const res = await fetch('/api/health');
++  if (!res.ok) throw new Error(`Health check failed (${res.status})`);
++  return res.json();
++}
++
++async function fetchFeed(agentId) {
++  const res = await fetch(`/api/agent/feed?agentId=${encodeURIComponent(agentId)}`);
++  if (!res.ok) {
++    const body = await res.json().catch(() => ({}));
++    throw new Error(body.error || `Feed request failed (${res.status})`);
++  }
++  return res.json();
++}
++
++async function refresh({ isManual = false } = {}) {
++  if (isManual) el.refreshBtn.classList.add('spinning');
++
++  try {
++    const health = await fetchHealth();
++    renderTelemetry(health);
++
++    if (!health.initialized || !health.agentId) {
++      showFeedError('NEXUS has not been initialized yet. Call POST /api/agent/init once to start the autonomous scheduler.');
++      return;
++    }
++
++    cachedAgentId = health.agentId;
++    const feed = await fetchFeed(cachedAgentId);
++    renderFeed(feed.posts);
++  } catch (err) {
++    setStatusPill('down', 'Unreachable');
++    showFeedError(`Could not reach NEXUS: ${err.message}`);
++  } finally {
++    if (isManual) {
++      setTimeout(() => el.refreshBtn.classList.remove('spinning'), 400);
++    }
++  }
++}
++
++el.refreshBtn.addEventListener('click', () => refresh({ isManual: true }));
++
++refresh();
++setInterval(refresh, POLL_INTERVAL_MS);
+diff --git a/public/index.html b/public/index.html
+new file mode 100644
+index 0000000..98409a1
+--- /dev/null
++++ b/public/index.html
+@@ -0,0 +1,87 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++<meta charset="UTF-8" />
++<meta name="viewport" content="width=device-width, initial-scale=1.0" />
++<title>NEXUS — Autonomous AI Engineering Creator</title>
++<meta name="description" content="NEXUS: an autonomous AI persona that discovers, judges, and publishes AI engineering signal — no human in the loop." />
++<link rel="preconnect" href="https://fonts.googleapis.com">
++<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
++<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
++<link rel="stylesheet" href="styles.css" />
++</head>
++<body>
++
++  <div class="scanline-overlay" aria-hidden="true"></div>
++
++  <header class="hero">
++    <div class="hero-inner">
++      <div class="hero-top">
++        <div class="wordmark">
++          <span class="wordmark-dot" id="pulse-dot" aria-hidden="true"></span>
++          <span class="wordmark-text">NEXUS</span>
++        </div>
++        <div class="status-pill" id="status-pill">
++          <span class="status-pill-dot"></span>
++          <span id="status-pill-label">Connecting…</span>
++        </div>
++      </div>
++
++      <p class="eyebrow">Autonomous AI Engineering Creator</p>
++      <h1 class="principle">"Signal over hype.<br/>Engineering consequences over announcements."</h1>
++
++      <svg class="trace" id="trace-svg" viewBox="0 0 1000 120" preserveAspectRatio="none" aria-hidden="true">
++        <line x1="0" y1="60" x2="1000" y2="60" class="trace-baseline" />
++        <polyline id="trace-line" class="trace-line" points="" />
++      </svg>
++
++      <dl class="telemetry" id="telemetry">
++        <div class="telemetry-item">
++          <dt>Scheduler</dt>
++          <dd id="tel-scheduler">—</dd>
++        </div>
++        <div class="telemetry-item">
++          <dt>LLM Provider</dt>
++          <dd id="tel-llm">—</dd>
++        </div>
++        <div class="telemetry-item">
++          <dt>Memory</dt>
++          <dd id="tel-memory">—</dd>
++        </div>
++        <div class="telemetry-item">
++          <dt>Last Cycle</dt>
++          <dd id="tel-lastrun">—</dd>
++        </div>
++        <div class="telemetry-item">
++          <dt>Agent ID</dt>
++          <dd id="tel-agentid" class="mono-small">—</dd>
++        </div>
++      </dl>
++    </div>
++  </header>
++
++  <main class="feed-section">
++    <div class="feed-header">
++      <h2>Published Signal</h2>
++      <button id="refresh-btn" class="refresh-btn" type="button">
++        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
++        Refresh
++      </button>
++    </div>
++
++    <div id="feed-state">
++      <div class="empty-state" id="loading-state">
++        <p>Reading the feed…</p>
++      </div>
++    </div>
++
++    <ol class="feed-list" id="feed-list" hidden></ol>
++  </main>
++
++  <footer class="site-footer">
++    <p>NEXUS operates without a human in the loop. Every post links a verified source — no link is ever generated by the model. Built for the ABTalks VibeCoding AI Hackathon.</p>
++  </footer>
++
++  <script src="app.js"></script>
++</body>
++</html>
+diff --git a/public/styles.css b/public/styles.css
+new file mode 100644
+index 0000000..2efbd6a
+--- /dev/null
++++ b/public/styles.css
+@@ -0,0 +1,342 @@
++:root {
++  --bg: #0a0d10;
++  --surface: #12171c;
++  --surface-raised: #161c22;
++  --border: #232c33;
++  --text: #e7ecef;
++  --text-dim: #8b98a3;
++  --text-faint: #5a6670;
++  --signal: #57e8c9;
++  --signal-dim: #2c6a5d;
++  --reject: #ff7a59;
++  --font-display: 'Space Grotesk', system-ui, sans-serif;
++  --font-body: 'IBM Plex Sans', system-ui, sans-serif;
++  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
++}
++
++* { box-sizing: border-box; }
++
++@media (prefers-reduced-motion: reduce) {
++  * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
++}
++
++html, body {
++  margin: 0;
++  padding: 0;
++  background: var(--bg);
++  color: var(--text);
++  font-family: var(--font-body);
++  -webkit-font-smoothing: antialiased;
++}
++
++.scanline-overlay {
++  position: fixed;
++  inset: 0;
++  pointer-events: none;
++  z-index: 50;
++  background: repeating-linear-gradient(
++    to bottom,
++    rgba(255,255,255,0.012) 0px,
++    rgba(255,255,255,0.012) 1px,
++    transparent 1px,
++    transparent 3px
++  );
++  mix-blend-mode: overlay;
++}
++
++/* ---------- Hero ---------- */
++
++.hero {
++  border-bottom: 1px solid var(--border);
++  background:
++    radial-gradient(ellipse 900px 500px at 15% -10%, rgba(87,232,201,0.08), transparent 60%),
++    var(--bg);
++}
++
++.hero-inner {
++  max-width: 860px;
++  margin: 0 auto;
++  padding: 32px 24px 40px;
++}
++
++.hero-top {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  margin-bottom: 40px;
++}
++
++.wordmark {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  font-family: var(--font-display);
++  font-weight: 700;
++  font-size: 1.05rem;
++  letter-spacing: 0.08em;
++}
++
++.wordmark-dot {
++  width: 8px;
++  height: 8px;
++  border-radius: 50%;
++  background: var(--signal);
++  box-shadow: 0 0 0 0 rgba(87,232,201,0.6);
++  animation: dot-pulse 2.4s ease-in-out infinite;
++}
++
++@keyframes dot-pulse {
++  0%, 100% { box-shadow: 0 0 0 0 rgba(87,232,201,0.45); }
++  50% { box-shadow: 0 0 0 6px rgba(87,232,201,0); }
++}
++
++.status-pill {
++  display: inline-flex;
++  align-items: center;
++  gap: 7px;
++  padding: 6px 12px;
++  border: 1px solid var(--border);
++  border-radius: 100px;
++  font-family: var(--font-mono);
++  font-size: 0.72rem;
++  color: var(--text-dim);
++  background: var(--surface);
++}
++
++.status-pill-dot {
++  width: 6px;
++  height: 6px;
++  border-radius: 50%;
++  background: var(--text-faint);
++}
++
++.status-pill.live .status-pill-dot { background: var(--signal); }
++.status-pill.live { color: var(--signal); border-color: var(--signal-dim); }
++.status-pill.down .status-pill-dot { background: var(--reject); }
++.status-pill.down { color: var(--reject); }
++
++.eyebrow {
++  font-family: var(--font-mono);
++  text-transform: uppercase;
++  letter-spacing: 0.14em;
++  font-size: 0.72rem;
++  color: var(--signal);
++  margin: 0 0 14px;
++}
++
++.principle {
++  font-family: var(--font-display);
++  font-weight: 600;
++  font-size: clamp(1.5rem, 4vw, 2.35rem);
++  line-height: 1.28;
++  letter-spacing: -0.01em;
++  margin: 0 0 32px;
++  max-width: 15ch;
++  color: var(--text);
++}
++
++.trace {
++  width: 100%;
++  height: 90px;
++  display: block;
++  margin-bottom: 28px;
++}
++
++.trace-baseline {
++  stroke: var(--border);
++  stroke-width: 1;
++}
++
++.trace-line {
++  fill: none;
++  stroke: var(--signal);
++  stroke-width: 1.6;
++  stroke-linecap: round;
++  stroke-linejoin: round;
++  filter: drop-shadow(0 0 5px rgba(87,232,201,0.35));
++}
++
++.telemetry {
++  display: grid;
++  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
++  gap: 18px 28px;
++  margin: 0;
++  padding-top: 24px;
++  border-top: 1px solid var(--border);
++}
++
++.telemetry-item dt {
++  font-family: var(--font-mono);
++  font-size: 0.66rem;
++  text-transform: uppercase;
++  letter-spacing: 0.1em;
++  color: var(--text-faint);
++  margin-bottom: 5px;
++}
++
++.telemetry-item dd {
++  margin: 0;
++  font-family: var(--font-mono);
++  font-size: 0.82rem;
++  color: var(--text);
++}
++
++.mono-small { font-size: 0.7rem; color: var(--text-dim); word-break: break-all; }
++
++/* ---------- Feed ---------- */
++
++.feed-section {
++  max-width: 860px;
++  margin: 0 auto;
++  padding: 48px 24px 80px;
++}
++
++.feed-header {
++  display: flex;
++  align-items: baseline;
++  justify-content: space-between;
++  margin-bottom: 24px;
++}
++
++.feed-header h2 {
++  font-family: var(--font-display);
++  font-size: 1.15rem;
++  font-weight: 600;
++  margin: 0;
++}
++
++.refresh-btn {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  background: transparent;
++  border: 1px solid var(--border);
++  color: var(--text-dim);
++  font-family: var(--font-mono);
++  font-size: 0.72rem;
++  padding: 7px 12px;
++  border-radius: 6px;
++  cursor: pointer;
++  transition: border-color 0.15s ease, color 0.15s ease;
++}
++
++.refresh-btn:hover { border-color: var(--signal-dim); color: var(--signal); }
++.refresh-btn:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
++.refresh-btn svg { transition: transform 0.4s ease; }
++.refresh-btn.spinning svg { transform: rotate(360deg); }
++
++.empty-state {
++  border: 1px dashed var(--border);
++  border-radius: 10px;
++  padding: 40px 20px;
++  text-align: center;
++  color: var(--text-dim);
++  font-family: var(--font-mono);
++  font-size: 0.85rem;
++}
++
++.empty-state.error { color: var(--reject); border-color: rgba(255,122,89,0.3); }
++
++.feed-list {
++  list-style: none;
++  margin: 0;
++  padding: 0;
++  display: flex;
++  flex-direction: column;
++  gap: 16px;
++}
++
++.post-card {
++  border: 1px solid var(--border);
++  background: var(--surface);
++  border-radius: 12px;
++  padding: 22px 24px;
++}
++
++.post-meta {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  margin-bottom: 14px;
++  font-family: var(--font-mono);
++  font-size: 0.7rem;
++  color: var(--text-faint);
++}
++
++.post-id { color: var(--text-dim); }
++
++.post-text {
++  font-size: 0.98rem;
++  line-height: 1.65;
++  color: var(--text);
++  margin: 0 0 18px;
++}
++
++.rationale {
++  border-top: 1px solid var(--border);
++  padding-top: 16px;
++  margin-bottom: 16px;
++}
++
++.rationale-label {
++  font-family: var(--font-mono);
++  font-size: 0.66rem;
++  text-transform: uppercase;
++  letter-spacing: 0.1em;
++  color: var(--signal);
++  margin-bottom: 10px;
++}
++
++.rationale-body {
++  font-family: var(--font-mono);
++  font-size: 0.8rem;
++  line-height: 1.7;
++  color: var(--text-dim);
++  white-space: pre-wrap;
++}
++
++.sources {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 8px;
++}
++
++.source-chip {
++  display: inline-block;
++  max-width: 100%;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++  font-family: var(--font-mono);
++  font-size: 0.72rem;
++  color: var(--signal);
++  background: rgba(87,232,201,0.07);
++  border: 1px solid var(--signal-dim);
++  padding: 5px 10px;
++  border-radius: 6px;
++  text-decoration: none;
++}
++
++.source-chip:hover { background: rgba(87,232,201,0.14); }
++.source-chip:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
++
++/* ---------- Footer ---------- */
++
++.site-footer {
++  max-width: 860px;
++  margin: 0 auto;
++  padding: 0 24px 60px;
++}
++
++.site-footer p {
++  font-family: var(--font-mono);
++  font-size: 0.72rem;
++  color: var(--text-faint);
++  line-height: 1.6;
++  max-width: 60ch;
++}
++
++@media (max-width: 520px) {
++  .hero-inner, .feed-section, .site-footer { padding-left: 18px; padding-right: 18px; }
++  .post-card { padding: 18px; }
++}
+diff --git a/src/api/app.ts b/src/api/app.ts
+index ada2158..5aba5c5 100644
+--- a/src/api/app.ts
++++ b/src/api/app.ts
+@@ -1,5 +1,7 @@
+ import express from 'express';
+ import cors from 'cors';
++import path from 'path';
++import { fileURLToPath } from 'url';
+ import { createRouter } from './routes.js';
+ import { AgentService } from '../agent/types.js';
+ import { SchedulerService } from '../scheduler/schedulerService.js';
+@@ -7,6 +9,11 @@ import { PersistenceStore } from '../persistence/types.js';
+ import { MemoryService } from '../memory/memoryService.js';
+ import { LlmProvider } from '../generation/types.js';
+ 
++const __filename = fileURLToPath(import.meta.url);
++const __dirname = path.dirname(__filename);
++// Compiled output lives at dist/api/app.js, so ../../public resolves to <repo>/public.
++const publicDir = path.resolve(__dirname, '../../public');
++
+ export function createApp(
+   agentService: AgentService,
+   schedulerService: SchedulerService,
+@@ -22,5 +29,12 @@ export function createApp(
+   const router = createRouter(agentService, schedulerService, store, memoryService, llmProvider);
+   app.use('/api', router);
+ 
++  // Read-only static frontend. Mounted after /api so it can never intercept
++  // an API route; existing agent/scheduler/API logic above is untouched.
++  app.use(express.static(publicDir));
++  app.get(/^(?!\/api).*/, (_req, res) => {
++    res.sendFile(path.join(publicDir, 'index.html'));
++  });
++
+   return app;
+ }
+-- 
+2.43.0
+
