@@ -1,8 +1,45 @@
-# NEXUS — Autonomous AI Creator
+# NEXUS — Autonomous AI Engineering Creator
 
-> Problem Statement 3: Autonomous AI & Technology Creator (AI Hackathon Project)
+NEXUS is an autonomous AI/technology persona that discovers live technical signals, decides what deserves publication, generates engineering-focused commentary, remembers previous topics, and publishes autonomously over time.
 
-NEXUS is an autonomous AI engineering persona designed to operate continuously and independently after initialization. It discovers live AI/technology developments from public RSS/Atom feeds, applies strict technical editorial judgment, checks novelty against previously published content, generates structured technical posts using Google Gemini LLMs, and persists posts over time without human prompts or evaluator instructions.
+**Core Editorial Principle:** "Signal over hype. Engineering consequences over announcements."
+
+## Why NEXUS is Autonomous
+
+NEXUS operates on a completely autonomous lifecycle. Once initialized via `POST /api/agent/init`, the background scheduler continues operating indefinitely without further human prompts.
+
+**Live sources** → **Discovery** → **Novelty/Memory** → **Editorial Judge** → **Gemini** → **Persistence** → **Feed**
+
+## Live Production
+
+- **Base URL:** [https://nexus-production-4f5d.up.railway.app](https://nexus-production-4f5d.up.railway.app)
+- **Health Check:** [GET /api/health](https://nexus-production-4f5d.up.railway.app/api/health)
+- **Feed Endpoint:** `GET /api/agent/feed?agentId=<agentId returned by POST /api/agent/init>`
+
+## How this satisfies Problem Statement 3
+
+| Requirement | Implementation |
+|---|---|
+| **1. Topic Discovery** | Fetches live RSS/Atom feeds to discover fresh candidates. |
+| **2. Editorial Judgment** | Evaluates topics against strict criteria, explicitly rejecting hype or low-signal content. |
+| **3. Consistent Persona** | Generates posts in a consistent, engineering-focused voice. |
+| **4. Memory** | Avoids duplicates by tracking previously processed Topic IDs. |
+| **5. Autonomous Publishing** | A singleton background scheduler reliably triggers processing cycles over time. |
+| **6. Publishing Rationale** | Output explicitly contains reasons for selection, relevance, and editorial score. |
+| **7. Sources** | Each generated post links back to verified, actual HTTP/HTTPS sources. |
+| **8. Required API Endpoints** | Fully implements the autonomous `/api/agent/init` and `/api/agent/feed` contracts. |
+
+## Judge / Demo Flow
+
+A typical 2-minute demonstration of NEXUS autonomy:
+1. Call `POST /api/agent/init` once to initialize.
+2. Observe scheduler activation.
+3. Show live topic discovery.
+4. Show editorial rejection/acceptance.
+5. Show an autonomous generated post appearing in the feed.
+6. Show rationale and source URLs.
+7. Show later feed retrieval without another prompt.
+8. Explain duplicate avoidance and persistence.
 
 ---
 
